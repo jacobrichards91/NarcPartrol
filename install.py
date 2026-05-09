@@ -154,12 +154,16 @@ _CUDA_TAG_CANDIDATES: dict[int, list[str]] = {
     11: ["cu118"],
 }
 
-# For older GPUs (compute capability < 7.5 — Pascal and before) we pin to an
-# older PyTorch release whose wheels still carry sm_61 / sm_60 / sm_70 kernels.
-# Modern PyTorch (2.6+) was built only for Turing+ on the newer cu12x indexes.
-_LEGACY_GPU_TORCH_VERSION  = "2.5.1"
-_LEGACY_GPU_VISION_VERSION = "0.20.1"
-_LEGACY_GPU_TAGS           = ["cu121", "cu118"]
+# For older GPUs (compute capability < 7.5 — Pascal and before) we must use an
+# older PyTorch release.  sm_61 support was silently dropped in PyTorch 2.5
+# (both cu121 and cu118 builds).  PyTorch 2.4.x+cu118 is the newest release
+# that still ships sm_60/sm_61 kernels.  Try newest-compatible first.
+_LEGACY_GPU_CANDIDATES: list[tuple[str, str, str]] = [
+    # (torch_version, torchvision_version, wheel_tag)
+    ("2.4.0", "0.19.0", "cu118"),
+    ("2.3.1", "0.18.1", "cu118"),
+    ("2.2.2", "0.17.2", "cu118"),
+]
 
 
 def _detect_compute_cap(smi_path: str) -> float | None:
@@ -220,9 +224,10 @@ def detect_gpu() -> tuple[list[str], float | None]:
     # Old GPU (pre-Turing): force the legacy wheel set
     if cc is not None and cc < 7.5:
         warn(f"GPU compute capability {cc} is older than Turing (sm_75).")
-        warn(f"Will pin PyTorch to {_LEGACY_GPU_TORCH_VERSION} on cu121/cu118 wheels")
-        warn("which still ship sm_60/sm_61 kernels.  Newer PyTorch dropped these.")
-        return _LEGACY_GPU_TAGS, cc
+        warn("PyTorch 2.5+ dropped sm_60/sm_61 kernels.  Will try PyTorch 2.4.0→2.2.2")
+        warn("on cu118 wheels, which still ship sm_60/sm_61 support.")
+        # Return a sentinel; install_pytorch handles the actual candidate loop
+        return ["__legacy__"], cc
 
     tags = _CUDA_TAG_CANDIDATES.get(cuda_major)
     if tags is None:
@@ -382,16 +387,36 @@ def _torch_works_on_gpu(gpu_cc: float | None = None) -> bool:
 def install_pytorch(cuda_tags: list[str], compute_cap: float | None) -> None:
     step(4, 8, "PyTorch")
 
-    want_gpu     = cuda_tags != ["cpu"]
-    legacy_gpu   = compute_cap is not None and compute_cap < 7.5
-    pinned_torch = (
-        f"torch=={_LEGACY_GPU_TORCH_VERSION}"
-        if legacy_gpu else "torch"
-    )
-    pinned_vision = (
-        f"torchvision=={_LEGACY_GPU_VISION_VERSION}"
-        if legacy_gpu else "torchvision"
-    )
+    want_gpu   = cuda_tags != ["cpu"]
+    legacy_gpu = compute_cap is not None and compute_cap < 7.5
+
+    def _purge_torch() -> None:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "uninstall", "-y", "torch", "torchvision"],
+            capture_output=True,
+        )
+
+    def _reload_and_check() -> bool:
+        """Force-reload torch modules and confirm the GPU actually works."""
+        if not want_gpu:
+            return True
+        for mod in list(sys.modules):
+            if mod == "torch" or mod.startswith("torch."):
+                del sys.modules[mod]
+        return _torch_works_on_gpu(compute_cap)
+
+    def _pip_install(torch_spec: str, vision_spec: str, url: str) -> bool:
+        """pip-install the given specs from url. Returns True on exit 0."""
+        info("  (PyTorch wheels are 2+ GB — download may take several minutes)")
+        info("  pip output streaming below:")
+        print(_c("90", "  " + "─" * 60))
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade",
+             "--progress-bar", "on",
+             torch_spec, vision_spec, "--index-url", url],
+        )
+        print(_c("90", "  " + "─" * 60))
+        return result.returncode == 0
 
     # Check if a working install is already in place
     try:
@@ -407,77 +432,66 @@ def install_pytorch(cuda_tags: list[str], compute_cap: float | None) -> None:
                 pass
             info(f"PyTorch {torch.__version__} is installed but does not run on this GPU.")
             info(f"  GPU arch needed: sm_{int((compute_cap or 0) * 10)}")
-            info(f"  Wheel was built for: {', '.join(arch_list) or 'unknown'}")
+            info(f"  Wheel arch list: {', '.join(arch_list) or 'unknown'}")
             info("Uninstalling so we can install a compatible build ...")
-            subprocess.run(
-                [sys.executable, "-m", "pip", "uninstall", "-y", "torch", "torchvision"],
-                capture_output=True,
-            )
+            _purge_torch()
         else:
             ok(f"PyTorch {torch.__version__} already installed (CPU mode)")
             return
     except ImportError:
         pass
 
-    def _verify_after_install() -> bool:
-        """After a pip install, force-reload torch and check it runs on the GPU."""
-        if not want_gpu:
-            return True
-        for mod in list(sys.modules):
-            if mod == "torch" or mod.startswith("torch."):
-                del sys.modules[mod]
-        return _torch_works_on_gpu(compute_cap)
-
-    def _try_install(tag: str) -> bool:
-        """Attempt pip-install of torch with the given wheel tag, then verify it
-        works on this GPU.  Returns True only when both succeed."""
-        if tag == "cpu":
-            url = "https://download.pytorch.org/whl/cpu"
-        else:
+    # ── Legacy GPU path (Pascal / CC < 7.5) ─────────────────────────────────
+    # sm_61 was dropped in PyTorch 2.5 (both cu121 and cu118 builds).
+    # Try each candidate from newest to oldest until one actually works.
+    if legacy_gpu:
+        for tv, vv, tag in _LEGACY_GPU_CANDIDATES:
+            info(f"Trying PyTorch {tv}+{tag} / torchvision {vv}  (legacy GPU build)")
             url = f"https://download.pytorch.org/whl/{tag}"
-        if legacy_gpu:
-            info(f"Trying PyTorch {_LEGACY_GPU_TORCH_VERSION} on {tag} (legacy-GPU build)")
+            if not _pip_install(f"torch=={tv}", f"torchvision=={vv}", url):
+                warn(f"  pip failed for torch=={tv}+{tag} — trying next candidate")
+                continue
+            ok(f"Installed torch=={tv}+{tag} — verifying on GPU ...")
+            if _reload_and_check():
+                ok(f"PyTorch {tv}+{tag} runs on this GPU")
+                break
+            warn(f"  torch=={tv}+{tag} installed but does not run on this GPU (sm_61 missing).")
+            warn("  Trying an older release ...")
+            _purge_torch()
         else:
-            info(f"Trying PyTorch wheel index: {tag}")
-        info("  (PyTorch wheels are 2+ GB — download may take several minutes)")
-        info("  pip output streaming below:")
-        print(_c("90", "  " + "─" * 60))
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade",
-             "--progress-bar", "on",
-             pinned_torch, pinned_vision, "--index-url", url],
-        )
-        print(_c("90", "  " + "─" * 60))
-        if result.returncode != 0:
-            warn(f"  {tag} did not yield a usable wheel (pip exit {result.returncode})")
-            return False
-        ok(f"PyTorch installed from {tag} index — running GPU compatibility check")
-        if not _verify_after_install():
-            warn(f"  {tag} wheel installed but does not run on this GPU. Trying next tag.")
-            subprocess.run(
-                [sys.executable, "-m", "pip", "uninstall", "-y", "torch", "torchvision"],
-                capture_output=True,
-            )
-            return False
-        ok(f"PyTorch from {tag} runs successfully on this GPU")
-        return True
-
-    for tag in cuda_tags:
-        if _try_install(tag):
-            break
-    else:
-        info("Trying default PyPI index as final fallback ...")
-        print(_c("90", "  " + "─" * 60))
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade",
-             "--progress-bar", "on",
-             pinned_torch, pinned_vision],
-        )
-        print(_c("90", "  " + "─" * 60))
-        if result.returncode != 0 or not _verify_after_install():
             fail(
-                "Could not install a PyTorch build that runs on this GPU.\n\n"
-                f"  Python:         {sys.version.split()[0]}\n"
+                "None of the legacy PyTorch builds ran on this GPU.\n\n"
+                f"  Python:          {sys.version.split()[0]}\n"
+                f"  GPU compute cap: {compute_cap}\n\n"
+                "  The GTX 1080 Ti (sm_61) needs torch ≤ 2.4.x built for cu118.\n"
+                "  If you are on Python 3.12 and this still fails, try:\n"
+                "    pip install torch==2.4.0 torchvision==0.19.0 \\\n"
+                "      --index-url https://download.pytorch.org/whl/cu118\n"
+                "  and check https://pytorch.org/get-started/previous-versions/"
+            )
+
+    # ── Modern GPU path ──────────────────────────────────────────────────────
+    else:
+        for tag in cuda_tags:
+            if tag == "cpu":
+                url = "https://download.pytorch.org/whl/cpu"
+                info("Installing CPU-only PyTorch ...")
+            else:
+                url = f"https://download.pytorch.org/whl/{tag}"
+                info(f"Trying PyTorch wheel index: {tag}")
+            if not _pip_install("torch", "torchvision", url):
+                warn(f"  {tag} did not yield a usable wheel — trying next tag")
+                continue
+            ok(f"PyTorch installed from {tag} — verifying ...")
+            if _reload_and_check():
+                ok(f"PyTorch from {tag} runs successfully on this GPU")
+                break
+            warn(f"  {tag} wheel does not run on this GPU. Trying next tag.")
+            _purge_torch()
+        else:
+            fail(
+                "Could not install a PyTorch build that works on this system.\n\n"
+                f"  Python:          {sys.version.split()[0]}\n"
                 f"  GPU compute cap: {compute_cap}\n\n"
                 "  Fix options:\n"
                 "    A) Install Python 3.12 from python.org and rerun:\n"
@@ -486,8 +500,8 @@ def install_pytorch(cuda_tags: list[str], compute_cap: float | None) -> None:
                 "       right wheel for your GPU and Python."
             )
 
-    import torch  # re-import after install (already cleared from sys.modules)
-    ok(f"PyTorch {torch.__version__} installed and verified on GPU")
+    import torch  # re-import after install (modules were cleared above)
+    ok(f"PyTorch {torch.__version__} installed and verified")
 
 
 # ---------------------------------------------------------------------------
