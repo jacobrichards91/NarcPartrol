@@ -62,6 +62,7 @@ class FrameDetections:
 
 
 _model = None  # module-level singleton so we only load weights once
+_ort_session_swapped = False  # whether we've forced CUDA EP onto ultralytics' session
 
 
 def load_model() -> None:
@@ -70,6 +71,53 @@ def load_model() -> None:
         return
     from ultralytics import YOLO
     _model = YOLO(config.YOLO_MODEL)
+
+
+def _force_cuda_ep_if_needed() -> None:
+    """Ultralytics' AutoBackend picks ORT providers based on
+    torch.cuda.is_available().  On Pascal+Windows torch is CPU-only, so
+    even with device=0 ultralytics ends up on CPUExecutionProvider —
+    silently running YOLO on CPU.  After the first inference (which is
+    when AutoBackend is actually constructed), inspect the session and
+    swap it for a CUDA-backed one if needed.
+    """
+    global _ort_session_swapped
+    if _ort_session_swapped or _model is None:
+        return
+    if not config.YOLO_MODEL.lower().endswith(".onnx"):
+        return
+
+    predictor = getattr(_model, "predictor", None)
+    backend = getattr(predictor, "model", None) if predictor else None
+    sess = getattr(backend, "session", None)
+    if sess is None or not hasattr(sess, "get_providers"):
+        return
+
+    if sess.get_providers() and sess.get_providers()[0] == "CUDAExecutionProvider":
+        _ort_session_swapped = True
+        return
+
+    try:
+        import onnxruntime as ort
+        if "CUDAExecutionProvider" not in ort.get_available_providers():
+            # No CUDA EP installed — nothing we can do; leave on CPU.
+            _ort_session_swapped = True
+            return
+        from pathlib import Path as _P
+        model_path = config.YOLO_MODEL
+        p = _P(model_path)
+        if not p.is_absolute():
+            p = _P(__file__).resolve().parent.parent / model_path
+        new_sess = ort.InferenceSession(
+            str(p),
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+        backend.session = new_sess
+    except Exception:
+        # If anything goes wrong, leave the original session in place.
+        pass
+    finally:
+        _ort_session_swapped = True
 
 
 def detect_batch(
@@ -110,6 +158,9 @@ def detect_batch(
             verbose=False,
             **extra,
         )
+        # First-batch hook: AutoBackend exists now; force CUDA EP if needed.
+        if _is_onnx and not _ort_session_swapped:
+            _force_cuda_ep_if_needed()
 
         for res, fpath in zip(results, batch):
             h, w = res.orig_shape[:2]
