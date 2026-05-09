@@ -154,18 +154,38 @@ _CUDA_TAG_CANDIDATES: dict[int, list[str]] = {
     11: ["cu118"],
 }
 
+# For older GPUs (compute capability < 7.5 — Pascal and before) we pin to an
+# older PyTorch release whose wheels still carry sm_61 / sm_60 / sm_70 kernels.
+# Modern PyTorch (2.6+) was built only for Turing+ on the newer cu12x indexes.
+_LEGACY_GPU_TORCH_VERSION  = "2.5.1"
+_LEGACY_GPU_VISION_VERSION = "0.20.1"
+_LEGACY_GPU_TAGS           = ["cu121", "cu118"]
 
-def detect_gpu() -> list[str]:
+
+def _detect_compute_cap(smi_path: str) -> float | None:
+    """Return the GPU's compute capability as a float (e.g. 6.1, 7.5, 8.6)."""
+    # Newer drivers expose this directly:
+    result = run([smi_path, "--query-gpu=compute_cap", "--format=csv,noheader"])
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            try:
+                return float(line.strip())
+            except ValueError:
+                continue
+    return None
+
+
+def detect_gpu() -> tuple[list[str], float | None]:
     """
-    Return an ordered list of PyTorch wheel tags to try, e.g.
-    ['cu128', 'cu126', 'cu124', 'cu121'] for CUDA 13.x.
-    Falls back to ['cpu'] when no GPU is detected.
+    Return (wheel_tags, compute_capability).
+    wheel_tags is the ordered list of pip --index-url tags to try.
+    compute_capability is e.g. 6.1 for a 1080Ti, 8.6 for a 3090.
+    Both come from the local nvidia-smi.
     """
     step(2, 8, "GPU & CUDA detection")
 
     smi_path = shutil.which("nvidia-smi")
     if IS_WINDOWS and smi_path is None:
-        # nvidia-smi lives in System32 on Windows — may not be in PATH
         candidate = Path(r"C:\Windows\System32\nvidia-smi.exe")
         if candidate.exists():
             smi_path = str(candidate)
@@ -173,40 +193,46 @@ def detect_gpu() -> list[str]:
     if smi_path is None:
         warn("nvidia-smi not found — assuming no NVIDIA GPU.")
         warn("The pipeline will run on CPU.  Processing will be slow.")
-        return ["cpu"]
+        return ["cpu"], None
 
     result = run([smi_path])
     if result.returncode != 0:
         warn("nvidia-smi returned an error.  Falling back to CPU mode.")
-        return ["cpu"]
+        return ["cpu"], None
 
-    # Parse GPU name
     gpu_match = re.search(r"(?:GeForce|Quadro|Tesla|RTX|GTX|A\d)\s[\w\s]+", result.stdout)
     gpu_name  = gpu_match.group(0).strip() if gpu_match else "Unknown GPU"
 
-    # Parse CUDA version
     cuda_match = re.search(r"CUDA Version:\s*([\d.]+)", result.stdout)
     if not cuda_match:
         warn(f"GPU found ({gpu_name}) but could not read CUDA version.")
-        warn("Falling back to CPU PyTorch.  Install the CUDA toolkit and retry.")
-        return ["cpu"]
+        return ["cpu"], None
 
     cuda_ver   = cuda_match.group(1)
     cuda_major = int(cuda_ver.split(".")[0])
 
+    cc = _detect_compute_cap(smi_path)
+
     ok(f"GPU:  {gpu_name}")
     ok(f"CUDA: {cuda_ver}")
+    ok(f"Compute capability: {cc if cc is not None else 'unknown'}")
+
+    # Old GPU (pre-Turing): force the legacy wheel set
+    if cc is not None and cc < 7.5:
+        warn(f"GPU compute capability {cc} is older than Turing (sm_75).")
+        warn(f"Will pin PyTorch to {_LEGACY_GPU_TORCH_VERSION} on cu121/cu118 wheels")
+        warn("which still ship sm_60/sm_61 kernels.  Newer PyTorch dropped these.")
+        return _LEGACY_GPU_TAGS, cc
 
     tags = _CUDA_TAG_CANDIDATES.get(cuda_major)
     if tags is None:
         if cuda_major < 11:
             warn(f"CUDA {cuda_ver} is too old (need ≥ 11).  Falling back to CPU PyTorch.")
-            return ["cpu"]
-        # Unknown future major — try all known tags newest-first
+            return ["cpu"], cc
         tags = ["cu128", "cu126", "cu124", "cu121"]
 
     ok(f"Will try wheel tags (in order): {', '.join(tags)}")
-    return tags
+    return tags, cc
 
 
 # ---------------------------------------------------------------------------
@@ -319,39 +345,75 @@ def _install_mac_tools() -> None:
 # ---------------------------------------------------------------------------
 # Step 4 — PyTorch (CUDA-matched, with multi-tag fallback)
 # ---------------------------------------------------------------------------
-def install_pytorch(cuda_tags: list[str]) -> None:
-    step(4, 8, "PyTorch")
-
-    want_gpu = cuda_tags != ["cpu"]
-
-    # Check if already installed with the right CUDA support
+def _torch_works_on_gpu() -> bool:
+    """
+    Returns True only if torch can both report CUDA available AND actually
+    execute a kernel on the GPU.  Catches the case where torch is installed
+    but its compiled kernels don't include the host GPU's compute capability
+    (e.g. sm_61 missing from a cu128 wheel).
+    """
     try:
         import torch  # type: ignore
-        cuda_ok = torch.cuda.is_available()
-        if want_gpu and not cuda_ok:
-            info("CPU-only torch detected but GPU is available — reinstalling.")
-            raise ImportError
-        ok(f"PyTorch {torch.__version__} already installed  (cuda={cuda_ok})")
-        return
+        if not torch.cuda.is_available():
+            return False
+        # Force a tiny kernel launch — this is what raises if CC isn't covered
+        x = torch.zeros(8, device="cuda")
+        _ = (x + 1).cpu()
+        return True
+    except Exception:
+        return False
+
+
+def install_pytorch(cuda_tags: list[str], compute_cap: float | None) -> None:
+    step(4, 8, "PyTorch")
+
+    want_gpu     = cuda_tags != ["cpu"]
+    legacy_gpu   = compute_cap is not None and compute_cap < 7.5
+    pinned_torch = (
+        f"torch=={_LEGACY_GPU_TORCH_VERSION}"
+        if legacy_gpu else "torch"
+    )
+    pinned_vision = (
+        f"torchvision=={_LEGACY_GPU_VISION_VERSION}"
+        if legacy_gpu else "torchvision"
+    )
+
+    # Check if a working install is already in place
+    try:
+        import torch  # type: ignore
+        if want_gpu:
+            if _torch_works_on_gpu():
+                ok(f"PyTorch {torch.__version__} already installed and runs on GPU")
+                return
+            info(f"PyTorch {torch.__version__} is installed but does not run on this GPU.")
+            info("Uninstalling so we can install a compatible build ...")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "uninstall", "-y", "torch", "torchvision"],
+                capture_output=True,
+            )
+        else:
+            ok(f"PyTorch {torch.__version__} already installed (CPU mode)")
+            return
     except ImportError:
         pass
 
     def _try_install(tag: str) -> bool:
-        """Attempt to pip-install torch with the given wheel tag. Returns True on success."""
+        """Attempt pip-install of torch with the given wheel tag. True on success."""
         if tag == "cpu":
             url = "https://download.pytorch.org/whl/cpu"
         else:
             url = f"https://download.pytorch.org/whl/{tag}"
-        info(f"Trying PyTorch wheel index: {tag}")
+        if legacy_gpu:
+            info(f"Trying PyTorch {_LEGACY_GPU_TORCH_VERSION} on {tag} (legacy-GPU build)")
+        else:
+            info(f"Trying PyTorch wheel index: {tag}")
         info("  (PyTorch wheels are 2+ GB — download may take several minutes)")
         info("  pip output streaming below:")
         print(_c("90", "  " + "─" * 60))
-        # Stream pip output to terminal — no capture, no detached console.
-        # This lets the user see download progress in real time.
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install", "--upgrade",
              "--progress-bar", "on",
-             "torch", "torchvision", "--index-url", url],
+             pinned_torch, pinned_vision, "--index-url", url],
         )
         print(_c("90", "  " + "─" * 60))
         if result.returncode == 0:
@@ -360,35 +422,39 @@ def install_pytorch(cuda_tags: list[str]) -> None:
         warn(f"  {tag} did not yield a usable wheel (pip exit {result.returncode})")
         return False
 
-    # Try each preferred tag in order
     for tag in cuda_tags:
         if _try_install(tag):
             break
     else:
-        # Last resort: default PyPI index (some Python versions only have wheels there)
         info("Trying default PyPI index as final fallback ...")
         print(_c("90", "  " + "─" * 60))
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install", "--upgrade",
              "--progress-bar", "on",
-             "torch", "torchvision"],
+             pinned_torch, pinned_vision],
         )
         print(_c("90", "  " + "─" * 60))
         if result.returncode != 0:
             fail(
                 "Could not install PyTorch for this Python version.\n\n"
                 f"  Your Python: {sys.version.split()[0]}\n"
-                "  PyTorch wheel availability lags new Python releases by a few months.\n\n"
+                f"  GPU compute capability: {compute_cap}\n\n"
                 "  Fix options:\n"
                 "    A) Install Python 3.12 from python.org and rerun:\n"
                 "         py -3.12 install.py\n"
-                "    B) Wait for an official PyTorch release that supports your Python.\n"
-                "       Check https://pytorch.org/get-started/locally/ for current support."
+                "    B) Check https://pytorch.org/get-started/locally/ for the\n"
+                "       right wheel for your GPU and Python."
             )
 
     import importlib
     torch = importlib.import_module("torch")
-    ok(f"PyTorch {torch.__version__} installed  (cuda={torch.cuda.is_available()})")
+    cuda_ok = torch.cuda.is_available()
+    ok(f"PyTorch {torch.__version__} installed  (cuda_available={cuda_ok})")
+    if want_gpu and cuda_ok and not _torch_works_on_gpu():
+        warn("PyTorch reports CUDA available but cannot execute on this GPU.")
+        warn(f"Compute capability {compute_cap} may not be in the installed wheel.")
+        warn("If pipeline runs fail with 'unable to find an engine', rerun:")
+        warn(f"  {Path(sys.executable).name} install.py  (will reinstall a compatible build)")
 
 
 # ---------------------------------------------------------------------------
@@ -489,12 +555,22 @@ def verify() -> None:
         except Exception as e:
             errors.append(f"{mod}: {e}")
 
-    # PyTorch + CUDA
+    # PyTorch + CUDA + actual kernel launch
     try:
         import torch  # type: ignore
         cuda = torch.cuda.is_available()
         dev  = torch.cuda.get_device_name(0) if cuda else "CPU"
         ok(f"torch          {torch.__version__}  device={dev}")
+        if cuda:
+            try:
+                x = torch.zeros(8, device="cuda")
+                _ = (x + 1).cpu()
+                ok("cuda kernel    runs on GPU")
+            except RuntimeError as e:
+                errors.append(
+                    f"cuda kernel will not run on this GPU "
+                    f"(compute capability mismatch).\n             {e}"
+                )
     except Exception as e:
         errors.append(f"torch: {e}")
 
@@ -579,9 +655,9 @@ def main() -> None:
     print(_c("1", "\n  NarcPartrol — Installer\n  " + "─" * 36))
 
     check_python()
-    cuda_tags = detect_gpu()
+    cuda_tags, compute_cap = detect_gpu()
     install_system_deps()
-    install_pytorch(cuda_tags)
+    install_pytorch(cuda_tags, compute_cap)
     install_packages()
     predownload_model()
     place_config()
