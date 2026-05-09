@@ -363,32 +363,52 @@ def _activate_ort_fallback(compute_cap: float | None) -> None:
     warn("━" * 60)
     print()
 
-    # Step A: CPU PyTorch (needed by ultralytics for model loading etc.)
-    info("Installing CPU PyTorch ...")
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--upgrade",
-         "--progress-bar", "on", "torch", "torchvision",
-         "--index-url", "https://download.pytorch.org/whl/cpu"],
-    )
-    if result.returncode != 0:
-        fail("CPU PyTorch install failed — see output above.")
-    ok("CPU PyTorch installed")
+    # Step A: CPU PyTorch — reuse existing install if it's already CPU-only
+    _cpu_torch_ok = False
+    try:
+        import torch  # type: ignore
+        if not torch.cuda.is_available():
+            ok(f"PyTorch {torch.__version__} (CPU) already installed — keeping.")
+            _cpu_torch_ok = True
+    except ImportError:
+        pass
 
-    # Step B: onnxruntime-gpu
-    info("Installing onnxruntime-gpu ...")
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--upgrade",
-         "--progress-bar", "on", "onnxruntime-gpu"],
-    )
-    if result.returncode == 0:
-        ok("onnxruntime-gpu installed (CUDA EP will serve GPU inference)")
-    else:
-        warn("onnxruntime-gpu install failed — falling back to CPU onnxruntime.")
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "onnxruntime"],
-            check=True,
+    if not _cpu_torch_ok:
+        info("Installing CPU PyTorch ...")
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade",
+             "--progress-bar", "on", "torch", "torchvision",
+             "--index-url", "https://download.pytorch.org/whl/cpu"],
         )
-        warn("CPU onnxruntime installed.  GPU acceleration unavailable for inference.")
+        if result.returncode != 0:
+            fail("CPU PyTorch install failed — see output above.")
+        ok("CPU PyTorch installed")
+
+    # Step B: onnxruntime-gpu — check if CUDA EP already available
+    _ort_gpu_ok = False
+    try:
+        import onnxruntime as _ort  # type: ignore
+        if "CUDAExecutionProvider" in _ort.get_available_providers():
+            ok(f"onnxruntime-gpu {_ort.__version__} already installed with CUDA EP.")
+            _ort_gpu_ok = True
+    except ImportError:
+        pass
+
+    if not _ort_gpu_ok:
+        info("Installing onnxruntime-gpu ...")
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade",
+             "--progress-bar", "on", "onnxruntime-gpu"],
+        )
+        if result.returncode == 0:
+            ok("onnxruntime-gpu installed (CUDA EP will serve GPU inference)")
+        else:
+            warn("onnxruntime-gpu install failed — falling back to CPU onnxruntime.")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--upgrade", "onnxruntime"],
+                check=True,
+            )
+            warn("CPU onnxruntime installed.  GPU acceleration unavailable for inference.")
 
     _ORT_FALLBACK = True
     ok("ORT GPU fallback mode enabled — ONNX export will run in step 6")
@@ -465,7 +485,37 @@ def install_pytorch(cuda_tags: list[str], compute_cap: float | None) -> None:
         print(_c("90", "  " + "─" * 60))
         return result.returncode == 0
 
-    # Check if a working install is already in place
+    def _clear_torch_cache() -> None:
+        for mod in list(sys.modules):
+            if mod == "torch" or mod.startswith("torch."):
+                del sys.modules[mod]
+
+    def _finish(label: str) -> None:
+        _clear_torch_cache()
+        import torch as _t  # type: ignore
+        ok(f"PyTorch {_t.__version__} {label}")
+
+    # ── Windows + legacy GPU: skip CUDA download loop, go straight to ORT ────
+    # Confirmed May 2026: Windows PyTorch CUDA wheels for Python 3.12+ never
+    # included sm_61 kernels.  Downloading 3 x 2 GB candidates only to fail
+    # wastes 10+ minutes.  Jump directly to onnxruntime-gpu which supports CC 3.7+.
+    if legacy_gpu and IS_WINDOWS and want_gpu:
+        try:
+            import torch  # type: ignore
+            if not torch.cuda.is_available():
+                ok(f"PyTorch {torch.__version__} (CPU) already installed, keeping.")
+                _activate_ort_fallback(compute_cap)
+                _finish("(CPU) + onnxruntime-gpu ready")
+                return
+        except ImportError:
+            pass
+        info("Windows + GTX 1080 Ti (sm_61): PyTorch CUDA wheels exclude this arch.")
+        info("Skipping CUDA download loop — activating onnxruntime-gpu directly.")
+        _activate_ort_fallback(compute_cap)
+        _finish("(CPU) + onnxruntime-gpu ready")
+        return
+
+    # ── Check if a working GPU install is already in place ───────────────────
     try:
         import torch  # type: ignore
         if want_gpu:
@@ -477,9 +527,9 @@ def install_pytorch(cuda_tags: list[str], compute_cap: float | None) -> None:
                 arch_list = torch.cuda.get_arch_list()
             except Exception:
                 pass
-            info(f"PyTorch {torch.__version__} is installed but does not run on this GPU.")
-            info(f"  GPU arch needed: sm_{int((compute_cap or 0) * 10)}")
-            info(f"  Wheel arch list: {', '.join(arch_list) or 'unknown'}")
+            info(f"PyTorch {torch.__version__} installed but does not run on this GPU.")
+            info(f"  GPU arch needed : sm_{int((compute_cap or 0) * 10)}")
+            info(f"  Wheel arch list : {', '.join(arch_list) or 'unknown'}")
             info("Uninstalling so we can install a compatible build ...")
             _purge_torch()
         else:
@@ -488,66 +538,49 @@ def install_pytorch(cuda_tags: list[str], compute_cap: float | None) -> None:
     except ImportError:
         pass
 
-    # ── Legacy GPU path (Pascal / CC < 7.5) ─────────────────────────────────
-    # sm_61 was dropped in PyTorch 2.5 (both cu121 and cu118 builds).
-    # Try each candidate from newest to oldest until one actually works.
+    # ── Linux/Mac legacy GPU: cu118 wheels DO include sm_61 ──────────────────
     if legacy_gpu:
         for tv, vv, tag in _LEGACY_GPU_CANDIDATES:
             info(f"Trying PyTorch {tv}+{tag} / torchvision {vv}  (legacy GPU build)")
             url = f"https://download.pytorch.org/whl/{tag}"
             if not _pip_install(f"torch=={tv}", f"torchvision=={vv}", url):
-                warn(f"  pip failed for torch=={tv}+{tag} — trying next candidate")
+                warn(f"  pip failed for torch=={tv}+{tag} — trying next")
                 continue
             ok(f"Installed torch=={tv}+{tag} — verifying on GPU ...")
             if _reload_and_check():
                 ok(f"PyTorch {tv}+{tag} runs on this GPU")
                 break
-            warn(f"  torch=={tv}+{tag} installed but does not run on this GPU (sm_61 missing).")
-            warn("  Trying an older release ...")
+            warn(f"  torch=={tv}+{tag} does not run on this GPU (sm_61 missing).")
             _purge_torch()
         else:
             _activate_ort_fallback(compute_cap)
 
-    # ── Modern GPU path ──────────────────────────────────────────────────────
+    # ── Modern GPU ────────────────────────────────────────────────────────────
     else:
         for tag in cuda_tags:
-            if tag == "cpu":
-                url = "https://download.pytorch.org/whl/cpu"
-                info("Installing CPU-only PyTorch ...")
-            else:
-                url = f"https://download.pytorch.org/whl/{tag}"
-                info(f"Trying PyTorch wheel index: {tag}")
+            url = ("https://download.pytorch.org/whl/cpu" if tag == "cpu"
+                   else f"https://download.pytorch.org/whl/{tag}")
+            info(f"Trying PyTorch wheel index: {tag}")
             if not _pip_install("torch", "torchvision", url):
-                warn(f"  {tag} did not yield a usable wheel — trying next tag")
+                warn(f"  {tag} did not yield a usable wheel — trying next")
                 continue
             ok(f"PyTorch installed from {tag} — verifying ...")
             if _reload_and_check():
                 ok(f"PyTorch from {tag} runs successfully on this GPU")
                 break
-            warn(f"  {tag} wheel does not run on this GPU. Trying next tag.")
+            warn(f"  {tag} wheel does not run on this GPU. Trying next.")
             _purge_torch()
         else:
             fail(
-                "Could not install a PyTorch build that works on this system.\n\n"
+                "Could not install a working PyTorch build.\n\n"
                 f"  Python:          {sys.version.split()[0]}\n"
                 f"  GPU compute cap: {compute_cap}\n\n"
-                "  Fix options:\n"
-                "    A) Install Python 3.12 from python.org and rerun:\n"
-                "         py -3.12 install.py\n"
-                "    B) Check https://pytorch.org/get-started/locally/ for the\n"
-                "       right wheel for your GPU and Python."
+                "  Try: py -3.14 install.py  or  py -3.12 install.py\n"
+                "  See: https://pytorch.org/get-started/locally/"
             )
 
-    # Clear any stale cached torch modules before the final import so we get
-    # the freshly-installed version (CPU or GPU depending on path taken).
-    for _m in list(sys.modules):
-        if _m == "torch" or _m.startswith("torch."):
-            del sys.modules[_m]
-    import torch  # type: ignore
-    if _ORT_FALLBACK:
-        ok(f"PyTorch {torch.__version__} (CPU) installed — GPU inference via onnxruntime-gpu")
-    else:
-        ok(f"PyTorch {torch.__version__} installed and verified on GPU")
+    label = "(CPU) + onnxruntime-gpu" if _ORT_FALLBACK else "installed and verified on GPU"
+    _finish(label)
 
 
 # ---------------------------------------------------------------------------
