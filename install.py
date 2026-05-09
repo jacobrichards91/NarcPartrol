@@ -65,12 +65,19 @@ def step(n: int, total: int, msg: str) -> None:
 
 
 def run(cmd: list[str], check: bool = False, capture: bool = True) -> subprocess.CompletedProcess:
+    """Run a short command. Captures output by default for parsing version strings etc."""
     return subprocess.run(
         cmd, capture_output=capture, text=True,
         check=check,
-        # On Windows, don't show a new console window for subprocesses
-        creationflags=subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0,
     )
+
+
+def run_streaming(cmd: list[str]) -> int:
+    """Run a long command and let its stdout/stderr stream to the terminal."""
+    print(_c("90", "  " + "─" * 60))
+    rc = subprocess.run(cmd).returncode
+    print(_c("90", "  " + "─" * 60))
+    return rc
 
 
 def pip(*args: str) -> None:
@@ -299,21 +306,22 @@ def install_pytorch(cuda_tags: list[str]) -> None:
             url = "https://download.pytorch.org/whl/cpu"
         else:
             url = f"https://download.pytorch.org/whl/{tag}"
-        info(f"Trying PyTorch wheel index: {tag} ...")
+        info(f"Trying PyTorch wheel index: {tag}")
+        info("  (PyTorch wheels are 2+ GB — download may take several minutes)")
+        info("  pip output streaming below:")
+        print(_c("90", "  " + "─" * 60))
+        # Stream pip output to terminal — no capture, no detached console.
+        # This lets the user see download progress in real time.
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install", "--upgrade",
+             "--progress-bar", "on",
              "torch", "torchvision", "--index-url", url],
-            capture_output=True, text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0,
         )
+        print(_c("90", "  " + "─" * 60))
         if result.returncode == 0:
             ok(f"PyTorch installed from {tag} index")
             return True
-        # Surface the key error line so the user can see what went wrong
-        for line in result.stderr.splitlines():
-            if "ERROR" in line or "No matching" in line:
-                info(f"  pip said: {line.strip()}")
-                break
+        warn(f"  {tag} did not yield a usable wheel (pip exit {result.returncode})")
         return False
 
     # Try each preferred tag in order
@@ -323,11 +331,13 @@ def install_pytorch(cuda_tags: list[str]) -> None:
     else:
         # Last resort: default PyPI index (some Python versions only have wheels there)
         info("Trying default PyPI index as final fallback ...")
+        print(_c("90", "  " + "─" * 60))
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "torch", "torchvision"],
-            capture_output=True, text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0,
+            [sys.executable, "-m", "pip", "install", "--upgrade",
+             "--progress-bar", "on",
+             "torch", "torchvision"],
         )
+        print(_c("90", "  " + "─" * 60))
         if result.returncode != 0:
             fail(
                 "Could not install PyTorch for this Python version.\n\n"
