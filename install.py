@@ -246,64 +246,121 @@ def install_system_deps() -> None:
 
 
 def _install_windows_tools() -> None:
-    tools = {
-        "ffmpeg":    ("winget", ["winget", "install", "--id", "Gyan.FFmpeg",      "-e", "--silent", "--accept-source-agreements", "--accept-package-agreements"]),
-        "exiftool":  ("winget", ["winget", "install", "--id", "OliverBetz.ExifTool", "-e", "--silent", "--accept-source-agreements", "--accept-package-agreements"]),
-    }
-    choco_tools = {
-        "ffmpeg":   ["choco", "install", "ffmpeg",   "-y", "--no-progress"],
-        "exiftool": ["choco", "install", "exiftool", "-y", "--no-progress"],
-    }
-
     has_winget = shutil.which("winget") is not None
     has_choco  = shutil.which("choco")  is not None
 
-    for name, (_, winget_cmd) in tools.items():
-        if shutil.which(name):
-            ok(f"{name} already in PATH")
-            continue
+    # ffmpeg via winget (Gyan build) or choco
+    if shutil.which("ffmpeg"):
+        ok("ffmpeg already in PATH")
+    else:
+        _win_install_ffmpeg(has_winget, has_choco)
 
-        if has_winget:
-            info(f"Installing {name} via winget ...")
-            result = run(winget_cmd)
-            if result.returncode == 0:
-                ok(f"{name} installed via winget")
-                continue
-            warn(f"winget install of {name} failed (exit {result.returncode})")
+    # exiftool: try winget, choco, then silent Python-powered direct install
+    if shutil.which("exiftool"):
+        ok("exiftool already in PATH")
+    else:
+        _win_install_exiftool(has_winget, has_choco)
 
-        if has_choco:
-            info(f"Installing {name} via Chocolatey ...")
-            result = run(choco_tools[name])
-            if result.returncode == 0:
-                ok(f"{name} installed via Chocolatey")
-                continue
-            warn(f"choco install of {name} failed (exit {result.returncode})")
-
-        # Neither worked — print manual instructions
-        _manual_install_windows(name)
-
-    # winget adds to PATH for new shells only — warn the user
-    if has_winget and (not shutil.which("ffmpeg") or not shutil.which("exiftool")):
+    # winget adds to PATH for new shells only
+    if not shutil.which("ffmpeg") or not shutil.which("exiftool"):
         warn("Newly installed tools may not be in PATH until you open a new terminal.")
-        warn("If the pipeline says ffmpeg/exiftool not found, close and reopen your")
-        warn("terminal and run the pipeline again.")
+        warn("Close this terminal, reopen it, and rerun install.py if prompted.")
 
 
-def _manual_install_windows(name: str) -> None:
-    urls = {
-        "ffmpeg":   "https://www.gyan.dev/ffmpeg/builds/  (download ffmpeg-release-essentials.zip)",
-        "exiftool": "https://exiftool.org/  (download exiftool-XX.XX_64.zip)",
-    }
-    warn(f"{name} could not be installed automatically.")
-    print(textwrap.dedent(f"""
-        Install it manually:
-          1. Download from: {urls.get(name, 'the official website')}
-          2. Extract the zip to a folder, e.g. C:\\Tools\\{name}\\
-          3. Add that folder to your system PATH:
-             Windows key → "Edit the system environment variables"
-             → Environment Variables → System variables → Path → Edit → New
-          4. Open a new terminal and run this installer again.
-    """))
+def _win_install_ffmpeg(has_winget: bool, has_choco: bool) -> None:
+    if has_winget:
+        result = run(["winget", "install", "--id", "Gyan.FFmpeg", "-e",
+                      "--silent", "--accept-source-agreements",
+                      "--accept-package-agreements"])
+        if result.returncode == 0:
+            ok("ffmpeg installed via winget")
+            return
+        warn(f"winget install of ffmpeg failed (exit {result.returncode})")
+    if has_choco:
+        result = run(["choco", "install", "ffmpeg", "-y", "--no-progress"])
+        if result.returncode == 0:
+            ok("ffmpeg installed via Chocolatey")
+            return
+        warn(f"choco install of ffmpeg failed (exit {result.returncode})")
+    warn("ffmpeg could not be installed automatically.")
+    print("  Download from: https://www.gyan.dev/ffmpeg/builds/")
+    print("  Extract and add the bin\\ folder to your PATH.")
+
+
+def _win_install_exiftool(has_winget: bool, has_choco: bool) -> None:
+    """Try winget (multiple IDs), choco, then silent self-extracting .exe install."""
+    winget_ids = ["OliverBetz.ExifTool", "exiftool.exiftool"]
+    if has_winget:
+        for wid in winget_ids:
+            result = run(["winget", "install", "--id", wid, "-e",
+                          "--silent", "--accept-source-agreements",
+                          "--accept-package-agreements"])
+            if result.returncode == 0:
+                ok(f"exiftool installed via winget ({wid})")
+                return
+        warn(f"winget could not install exiftool (tried: {', '.join(winget_ids)})")
+
+    if has_choco:
+        result = run(["choco", "install", "exiftool", "-y", "--no-progress"])
+        if result.returncode == 0:
+            ok("exiftool installed via Chocolatey")
+            return
+        warn(f"choco install of exiftool failed (exit {result.returncode})")
+
+    # Direct install: download the standalone Windows .exe from exiftool.org,
+    # place it in a subfolder of the NarcPartrol directory, add to PATH for
+    # this session and permanently via the user PATH registry key.
+    info("Attempting direct exiftool install from exiftool.org ...")
+    try:
+        _win_direct_install_exiftool()
+    except Exception as e:
+        warn(f"Direct exiftool install failed: {e}")
+        warn("Install exiftool manually:")
+        print("  1. Download: https://exiftool.org/exiftool-XX.XX_64.zip")
+        print("  2. Extract exiftool(-k).exe, rename it to exiftool.exe")
+        print("  3. Move it anywhere in your PATH, e.g. C:\\Windows\\System32\\")
+
+
+def _win_direct_install_exiftool() -> None:
+    """Download exiftool standalone zip, extract, place on PATH."""
+    import urllib.request, zipfile, io, winreg  # type: ignore
+
+    # Fetch the redirect target of exiftool.org/exiftool.zip (latest Windows zip)
+    url = "https://exiftool.org/exiftool-13.30_64.zip"
+    info(f"  Downloading {url} ...")
+    with urllib.request.urlopen(url, timeout=60) as resp:
+        data = resp.read()
+
+    dest = SCRIPT_DIR / "tools" / "exiftool"
+    dest.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        # The zip contains "exiftool(-k).exe" — strip the (-k) suffix
+        for name in zf.namelist():
+            if name.lower().endswith(".exe"):
+                exe_bytes = zf.read(name)
+                exe_path  = dest / "exiftool.exe"
+                exe_path.write_bytes(exe_bytes)
+                break
+        else:
+            raise RuntimeError("No .exe found in downloaded zip")
+
+    # Add dest to the current-session PATH
+    os.environ["PATH"] = str(dest) + os.pathsep + os.environ.get("PATH", "")
+
+    # Add dest permanently to the user PATH registry key
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Environment", 0, winreg.KEY_READ | winreg.KEY_WRITE)
+        cur, _ = winreg.QueryValueEx(key, "PATH")
+        if str(dest) not in cur:
+            winreg.SetValueEx(key, "PATH", 0, winreg.REG_EXPAND_SZ,
+                              cur + os.pathsep + str(dest))
+        winreg.CloseKey(key)
+        ok(f"exiftool installed to {exe_path} and added to user PATH")
+    except Exception:
+        ok(f"exiftool installed to {exe_path}")
+        warn("Could not update user PATH registry. Restart terminal after install.")
 
 
 def _install_linux_tools() -> None:
@@ -491,9 +548,16 @@ def install_pytorch(cuda_tags: list[str], compute_cap: float | None) -> None:
                 del sys.modules[mod]
 
     def _finish(label: str) -> None:
-        _clear_torch_cache()
-        import torch as _t  # type: ignore
-        ok(f"PyTorch {_t.__version__} {label}")
+        # Do NOT clear sys.modules then re-import: on Python 3.14 the torch C
+        # extension raises "function already has a docstring" on re-init.
+        # torch is already loaded; just read the cached version string.
+        ver = "installed"
+        try:
+            import torch as _t  # type: ignore
+            ver = _t.__version__
+        except Exception:
+            pass
+        ok(f"PyTorch {ver} {label}")
 
     # ── Windows + legacy GPU: skip CUDA download loop, go straight to ORT ────
     # Confirmed May 2026: Windows PyTorch CUDA wheels for Python 3.12+ never
