@@ -1,0 +1,10 @@
+ultralytics>=8.0
+opencv-python>=4.8
+easyocr>=1.7
+anthropic>=0.25
+ffmpeg-python>=0.2
+geopy>=2.4
+Pillow>=10.0
+tqdm>=4.66
+numpy>=1.24
+requests>=2.31
