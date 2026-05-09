@@ -35,6 +35,10 @@ IS_LINUX   = platform.system() == "Linux"
 IS_MAC     = platform.system() == "Darwin"
 
 CONFIG_DEST = Path.home() / "Documents" / "NarcPartrol"
+
+# Set to True when ORT GPU fallback is activated; predownload_model and
+# place_config check this to export the ONNX model and update the config.
+_ORT_FALLBACK = False
 CONFIG_FILE = CONFIG_DEST / "narcpartrol.toml"
 
 # ---------------------------------------------------------------------------
@@ -348,6 +352,65 @@ def _install_mac_tools() -> None:
 
 
 # ---------------------------------------------------------------------------
+# ORT GPU fallback  (used when no PyTorch CUDA build supports this GPU)
+# ---------------------------------------------------------------------------
+
+def _activate_ort_fallback(compute_cap: float | None) -> None:
+    """
+    Windows PyTorch wheels omit Pascal (sm_61) and older arch SASS kernels —
+    even cu118 builds have shipped only sm_70+ since Python 3.12 support was
+    added.  When every PyTorch GPU candidate fails verification, we switch to:
+
+      CPU PyTorch  — ultralytics still needs PyTorch for preprocessing
+      onnxruntime-gpu — its CUDA EP ships CC 3.7+ and handles the actual
+                        inference; ultralytics routes .onnx models through it
+
+    The YOLO model is exported to ONNX in step 6 and the user config is
+    updated in step 7 so the pipeline loads the ONNX model at runtime.
+    """
+    global _ORT_FALLBACK
+    print()
+    warn("━" * 60)
+    warn("PyTorch CUDA wheels for Windows exclude Pascal (sm_61) arches.")
+    warn("Switching to ONNX Runtime GPU instead.")
+    warn(f"  GPU compute cap: {compute_cap}")
+    warn("  onnxruntime-gpu CUDA EP supports CC 3.7+, including sm_61.")
+    warn("  Inference speed is comparable to native PyTorch CUDA.")
+    warn("━" * 60)
+    print()
+
+    # Step A: CPU PyTorch (needed by ultralytics for model loading etc.)
+    info("Installing CPU PyTorch ...")
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--upgrade",
+         "--progress-bar", "on", "torch", "torchvision",
+         "--index-url", "https://download.pytorch.org/whl/cpu"],
+    )
+    if result.returncode != 0:
+        fail("CPU PyTorch install failed — see output above.")
+    ok("CPU PyTorch installed")
+
+    # Step B: onnxruntime-gpu
+    info("Installing onnxruntime-gpu ...")
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--upgrade",
+         "--progress-bar", "on", "onnxruntime-gpu"],
+    )
+    if result.returncode == 0:
+        ok("onnxruntime-gpu installed (CUDA EP will serve GPU inference)")
+    else:
+        warn("onnxruntime-gpu install failed — falling back to CPU onnxruntime.")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "onnxruntime"],
+            check=True,
+        )
+        warn("CPU onnxruntime installed.  GPU acceleration unavailable for inference.")
+
+    _ORT_FALLBACK = True
+    ok("ORT GPU fallback mode enabled — ONNX export will run in step 6")
+
+
+# ---------------------------------------------------------------------------
 # Step 4 — PyTorch (CUDA-matched, with multi-tag fallback)
 # ---------------------------------------------------------------------------
 def _torch_works_on_gpu(gpu_cc: float | None = None) -> bool:
@@ -459,16 +522,7 @@ def install_pytorch(cuda_tags: list[str], compute_cap: float | None) -> None:
             warn("  Trying an older release ...")
             _purge_torch()
         else:
-            fail(
-                "None of the legacy PyTorch builds ran on this GPU.\n\n"
-                f"  Python:          {sys.version.split()[0]}\n"
-                f"  GPU compute cap: {compute_cap}\n\n"
-                "  The GTX 1080 Ti (sm_61) needs torch ≤ 2.4.x built for cu118.\n"
-                "  If you are on Python 3.12 and this still fails, try:\n"
-                "    pip install torch==2.4.0 torchvision==0.19.0 \\\n"
-                "      --index-url https://download.pytorch.org/whl/cu118\n"
-                "  and check https://pytorch.org/get-started/previous-versions/"
-            )
+            _activate_ort_fallback(compute_cap)
 
     # ── Modern GPU path ──────────────────────────────────────────────────────
     else:
@@ -500,8 +554,16 @@ def install_pytorch(cuda_tags: list[str], compute_cap: float | None) -> None:
                 "       right wheel for your GPU and Python."
             )
 
-    import torch  # re-import after install (modules were cleared above)
-    ok(f"PyTorch {torch.__version__} installed and verified")
+    # Clear any stale cached torch modules before the final import so we get
+    # the freshly-installed version (CPU or GPU depending on path taken).
+    for _m in list(sys.modules):
+        if _m == "torch" or _m.startswith("torch."):
+            del sys.modules[_m]
+    import torch  # type: ignore
+    if _ORT_FALLBACK:
+        ok(f"PyTorch {torch.__version__} (CPU) installed — GPU inference via onnxruntime-gpu")
+    else:
+        ok(f"PyTorch {torch.__version__} installed and verified on GPU")
 
 
 # ---------------------------------------------------------------------------
@@ -524,35 +586,91 @@ def install_packages() -> None:
 def predownload_model() -> None:
     step(6, 8, "YOLO model weights")
 
-    # Read model name from the user config if it exists, else use default
-    model_name = "yolov8x-oiv7.pt"
-    if CONFIG_FILE.exists():
-        try:
-            if sys.version_info >= (3, 11):
-                import tomllib
-                with open(CONFIG_FILE, "rb") as f:
-                    data = tomllib.load(f)
-            else:
-                import tomli as tomllib  # type: ignore
-                with open(CONFIG_FILE, "rb") as f:
-                    data = tomllib.load(f)
-            model_name = data.get("detection", {}).get("model", model_name)
-        except Exception:
-            pass
+    pt_name = _yolo_model_name()
+    # If we're already pointing at an ONNX model (re-run after ORT setup) skip download.
+    if pt_name.endswith(".onnx"):
+        onnx_path = Path(pt_name) if Path(pt_name).is_absolute() else SCRIPT_DIR / pt_name
+        if onnx_path.exists():
+            ok(f"ONNX model already present: {onnx_path}")
+            return
+        pt_name = "yolov8x-oiv7.pt"  # need to (re)download .pt before re-export
 
-    info(f"Pre-downloading {model_name} (~140 MB — once only) ...")
-    code = textwrap.dedent(f"""
+    info(f"Pre-downloading {pt_name} (~140 MB — once only) ...")
+    download_code = textwrap.dedent(f"""
+        import os; os.chdir({str(SCRIPT_DIR)!r})
         from ultralytics import YOLO
         import sys
         try:
-            YOLO("{model_name}")
+            YOLO({pt_name!r})
             print("Model ready.")
         except Exception as e:
             print(f"Warning: {{e}}", file=sys.stderr)
             print("Model will download automatically on first run.")
     """)
-    subprocess.run([sys.executable, "-c", code], check=False)
-    ok(f"{model_name} ready")
+    subprocess.run([sys.executable, "-c", download_code], check=False)
+    ok(f"{pt_name} ready")
+
+    if _ORT_FALLBACK:
+        _export_onnx(pt_name)
+
+
+def _export_onnx(pt_name: str) -> None:
+    """Export the .pt YOLO model to ONNX for use with onnxruntime-gpu."""
+    onnx_name = pt_name.replace(".pt", ".onnx")
+    onnx_path = SCRIPT_DIR / onnx_name
+
+    if onnx_path.exists():
+        ok(f"ONNX model already exported: {onnx_path}")
+        _record_ort_model(onnx_path)
+        return
+
+    info(f"Exporting {pt_name} → {onnx_name}  (runs once, ~30 s) ...")
+    export_code = textwrap.dedent(f"""
+        import os; os.chdir({str(SCRIPT_DIR)!r})
+        from ultralytics import YOLO
+        model = YOLO({pt_name!r})
+        model.export(format='onnx', simplify=True)
+        print("Export complete.")
+    """)
+    result = subprocess.run([sys.executable, "-c", export_code])
+
+    if result.returncode != 0 or not onnx_path.exists():
+        warn("ONNX export failed — pipeline will run on CPU only.")
+        warn(f"To retry later:  python -c \"from ultralytics import YOLO; YOLO('{pt_name}').export(format='onnx')\"")
+        return
+
+    ok(f"ONNX model exported: {onnx_path}")
+    _record_ort_model(onnx_path)
+
+
+def _record_ort_model(onnx_path: Path) -> None:
+    """Write the ONNX model path into the user narcpartrol.toml.
+
+    This runs in step 6, before place_config (step 7), so we create the config
+    from the template if it doesn't exist yet.
+    """
+    if not CONFIG_FILE.exists():
+        CONFIG_DEST.mkdir(parents=True, exist_ok=True)
+        src = SCRIPT_DIR / "narcpartrol.toml"
+        if src.exists():
+            import shutil as _sh
+            _sh.copy2(src, CONFIG_FILE)
+    if not CONFIG_FILE.exists():
+        warn(f'Could not create config.  Set the model path manually:')
+        warn(f'  [detection]')
+        warn(f'  model = "{onnx_path}"')
+        return
+    try:
+        import tomlkit  # type: ignore  # installed in step 5
+        with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
+            doc = tomlkit.load(fh)
+        doc["detection"]["model"] = str(onnx_path)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
+            tomlkit.dump(doc, fh)
+        ok(f"Config updated: detection.model = {onnx_path.name}")
+    except Exception as e:
+        warn(f"Could not update config automatically: {e}")
+        warn(f'Manually set in narcpartrol.toml:  model = "{onnx_path}"')
 
 
 # ---------------------------------------------------------------------------
@@ -681,14 +799,20 @@ def verify(compute_cap: float | None = None) -> None:
 
     # ---- YOLO: load weights and run inference on a synthetic frame -------
     if not errors:
-        info("Running YOLO smoke test (loads model, runs on a 640×640 black frame)...")
+        model_path = _yolo_model_name()
+        is_onnx = model_path.lower().endswith(".onnx")
+        mode_tag = "ORT/ONNX" if is_onnx else "PyTorch"
+        info(f"Running YOLO smoke test ({mode_tag}, 640×640 black frame) ...")
         try:
             from ultralytics import YOLO  # type: ignore
             import numpy as np
-            model = YOLO(_yolo_model_name())
+            model = YOLO(model_path)
             blank = np.zeros((640, 640, 3), dtype=np.uint8)
-            results = model(blank, verbose=False)
-            ok(f"yolo smoke     ran inference on {len(results)} image(s)")
+            # For ONNX models, request GPU via ORT CUDA EP explicitly (device=0).
+            # If no GPU is available ORT falls back to CPU gracefully.
+            infer_kwargs = {"device": 0} if is_onnx else {}
+            results = model(blank, verbose=False, **infer_kwargs)
+            ok(f"yolo smoke     ran inference on {len(results)} image(s)  ({mode_tag})")
         except Exception as e:
             errors.append(f"yolo smoke test: {e}")
 

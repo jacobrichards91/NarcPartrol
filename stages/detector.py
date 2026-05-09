@@ -95,13 +95,20 @@ def detect_batch(
         if name in config.OCCLUDER_CLASS_NAMES
     }
 
+    # ONNX models use onnxruntime-gpu as backend.  ultralytics checks
+    # torch.cuda.is_available() to set the default device, which is False
+    # on a CPU-only torch install.  We must ask explicitly for GPU (device=0)
+    # so the ORT CUDA EP is selected; it falls back to CPU gracefully if needed.
+    _is_onnx = config.YOLO_MODEL.lower().endswith(".onnx")
+
     for start in range(0, len(frame_paths), batch_size):
         batch = frame_paths[start: start + batch_size]
-        # ultralytics accepts a list of paths directly
+        extra = {"device": 0} if _is_onnx else {}
         results = _model(
             [str(p) for p in batch],
             conf=config.BUILDING_CONF_MIN,
             verbose=False,
+            **extra,
         )
 
         for res, fpath in zip(results, batch):
