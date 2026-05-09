@@ -513,7 +513,19 @@ def _print_success() -> None:
   Config:  {CONFIG_FILE}
   Edit it to tune lot size, scoring weights, etc.
 
-  Run the pipeline:
+  ─────────────────────────────────────────────────────
+  Recommended:  start the UI
+  ─────────────────────────────────────────────────────
+    Windows:    launch_ui.bat   (double-click in Explorer)
+    Linux/Mac:  ./launch_ui.sh
+    Or:         python -m streamlit run app.py
+
+  The UI lets you set your API key, pick a video, see live
+  processing logs, and browse results — all in your browser.
+
+  ─────────────────────────────────────────────────────
+  Or run from the command line
+  ─────────────────────────────────────────────────────
     python pipeline.py drive.mov --output ./results
     python pipeline.py *.mov    --output ./results --skip-cloud
 
