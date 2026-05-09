@@ -74,7 +74,7 @@ def load_model() -> None:
 
 def detect_batch(
     frame_paths: list[Path],
-    batch_size: int = 16,
+    batch_size: int = config.YOLO_BATCH_SIZE,
 ) -> list[FrameDetections]:
     """
     Run inference on a list of frame images.  Returns one FrameDetections per

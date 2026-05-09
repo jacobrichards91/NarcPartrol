@@ -1,0 +1,117 @@
+# NarcPartrol — User Configuration
+# Location: ~/Documents/NarcPartrol/narcpartrol.toml
+#
+# Edit this file to tune the pipeline for your footage and street layout.
+# All values shown are the defaults.  Delete any line to restore its default.
+
+# ---------------------------------------------------------------------------
+# GPS Segmentation  (Stage 2)
+# ---------------------------------------------------------------------------
+[gps]
+
+# Minimum metres of travel before the pipeline starts a new house segment.
+# Tighten (e.g. 10) for dense urban row-houses.
+# Loosen (e.g. 25) for wide suburban lots or rural properties.
+min_lot_frontage_m = 15.0
+
+# ---------------------------------------------------------------------------
+# Frame Sampling  (Stage 3)
+# ---------------------------------------------------------------------------
+[sampling]
+
+# Frames per second extracted from the video by ffmpeg.
+# 4fps gives ~14,400 frames/hour — good balance of coverage vs. disk I/O.
+# Increase to 6 or 8 if the camera moves fast or you're missing optimal angles.
+fps = 4
+
+# ---------------------------------------------------------------------------
+# Building Detection  (Stage 4 — YOLOv8x Open Images V7)
+# ---------------------------------------------------------------------------
+[detection]
+
+# Which YOLO checkpoint to load.  yolov8x-oiv7.pt is the most accurate;
+# yolov8l-oiv7.pt is 25% faster if VRAM is tight.
+model = "yolov8x-oiv7.pt"
+
+# Minimum YOLO confidence score to accept a detection as a building.
+building_conf_min = 0.30
+
+# Building bbox must cover at least this fraction of the frame to be usable.
+# Raise (e.g. 0.20) to discard far-away or edge-clipped shots.
+building_coverage_min = 0.15
+
+# Open Images V7 class names treated as the structure of interest.
+building_classes = ["Building", "House", "Tower", "Skyscraper", "Shed"]
+
+# Classes whose bounding boxes overlapping the building trigger an occlusion penalty.
+occluder_classes = ["Car", "Truck", "Bus", "Van", "Person", "Tree", "Motorcycle"]
+
+# GPU batch size for YOLO inference.  Reduce if you hit VRAM errors.
+batch_size = 16
+
+# ---------------------------------------------------------------------------
+# Frame Quality Scoring  (Stage 5)
+# ---------------------------------------------------------------------------
+[scoring]
+
+# How many top-scored frames per house are carried forward to OCR / cloud.
+top_n_candidates = 3
+
+# Scoring weights — must sum to 1.0.
+# Increase w_sharpness if footage tends to be motion-blurred.
+# Increase w_coverage if you want bigger, fuller building shots.
+w_sharpness  = 0.30
+w_coverage   = 0.25
+w_frontality = 0.25
+w_exposure   = 0.20
+
+# Multiplier applied to the fraction of the building bbox blocked by occluders.
+# Higher = harsher occlusion penalty.
+occlusion_penalty_weight = 0.50
+
+# ---------------------------------------------------------------------------
+# Address Identification  (Stage 6)
+# ---------------------------------------------------------------------------
+[ocr]
+
+# Radius (metres) to search OpenStreetMap for known addresses near the GPS point.
+search_radius_m = 75
+
+# HTTP timeout (seconds) for Overpass API queries.
+timeout_s = 10
+
+# Minimum EasyOCR confidence to accept a detected number as a house address.
+conf_min = 0.40
+
+# ---------------------------------------------------------------------------
+# Cloud Quality Gate  (Stage 7 — Claude Haiku)
+# ---------------------------------------------------------------------------
+[cloud]
+
+# If the best local score is below this value, send top candidates to Claude.
+# Set to 0.0 to disable the cloud gate entirely (same effect as --skip-cloud).
+quality_threshold = 0.45
+
+# Claude model used for the vision quality gate.
+model = "claude-haiku-4-5-20251001"
+
+# Max image size (bytes) before resizing for the API call.
+max_image_bytes = 5242880  # 5 MB
+
+# ---------------------------------------------------------------------------
+# Export  (Stage 8)
+# ---------------------------------------------------------------------------
+[export]
+
+# Fractional padding added to each side of the building bounding box.
+# 0.12 = 12% extra on each edge so the house isn't clipped at the frame.
+crop_padding = 0.12
+
+# JPEG quality for saved snapshots.  95 = near-lossless; use 85 to save space.
+jpeg_quality = 95
+
+# Sub-directory inside your output folder where snapshots are saved.
+output_subdir = "snapshots"
+
+# Name of the CSV log file written to your output folder.
+log_filename = "log.csv"

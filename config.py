@@ -1,65 +1,133 @@
-# All tuneable knobs in one place — no magic numbers in stage files.
+"""
+Configuration loader for NarcPartrol.
+
+Resolution order (first match wins):
+  1. ~/Documents/NarcPartrol/narcpartrol.toml   ← user edits this
+  2. ~/.config/narcpartrol/narcpartrol.toml      ← XDG fallback
+  3. Built-in defaults below                     ← always works, no install needed
+
+All values are exposed as module-level constants so the rest of the codebase
+can do  `import config; config.JPEG_QUALITY`  without caring where the value
+came from.
+"""
+
+from __future__ import annotations
+
+import tomllib
+from pathlib import Path
+
 
 # ---------------------------------------------------------------------------
+# Built-in defaults  (mirrors narcpartrol.toml so the two never drift)
+# ---------------------------------------------------------------------------
+_DEFAULTS: dict = {
+    "gps": {
+        "min_lot_frontage_m": 15.0,
+    },
+    "sampling": {
+        "fps": 4,
+    },
+    "detection": {
+        "model": "yolov8x-oiv7.pt",
+        "building_conf_min": 0.30,
+        "building_coverage_min": 0.15,
+        "building_classes": ["Building", "House", "Tower", "Skyscraper", "Shed"],
+        "occluder_classes": ["Car", "Truck", "Bus", "Van", "Person", "Tree", "Motorcycle"],
+        "batch_size": 16,
+    },
+    "scoring": {
+        "top_n_candidates": 3,
+        "w_sharpness": 0.30,
+        "w_coverage": 0.25,
+        "w_frontality": 0.25,
+        "w_exposure": 0.20,
+        "occlusion_penalty_weight": 0.50,
+    },
+    "ocr": {
+        "search_radius_m": 75,
+        "timeout_s": 10,
+        "conf_min": 0.40,
+    },
+    "cloud": {
+        "quality_threshold": 0.45,
+        "model": "claude-haiku-4-5-20251001",
+        "max_image_bytes": 5 * 1024 * 1024,
+    },
+    "export": {
+        "crop_padding": 0.12,
+        "jpeg_quality": 95,
+        "output_subdir": "snapshots",
+        "log_filename": "log.csv",
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Locate and load the user config file
+# ---------------------------------------------------------------------------
+_SEARCH_PATHS: list[Path] = [
+    Path.home() / "Documents" / "NarcPartrol" / "narcpartrol.toml",
+    Path.home() / ".config" / "narcpartrol" / "narcpartrol.toml",
+]
+
+_CONFIG_FILE: Path | None = None
+_user: dict = {}
+
+for _candidate in _SEARCH_PATHS:
+    if _candidate.exists():
+        _CONFIG_FILE = _candidate
+        with open(_candidate, "rb") as _fh:
+            _user = tomllib.load(_fh)
+        break
+
+
+def _get(section: str, key: str):
+    """Return user value if present, otherwise the built-in default."""
+    return _user.get(section, {}).get(key, _DEFAULTS[section][key])
+
+
+def config_file_path() -> Path | None:
+    """Returns the path of the loaded config file, or None if using defaults."""
+    return _CONFIG_FILE
+
+
+# ---------------------------------------------------------------------------
+# Public constants — same names as before so no other file changes
+# ---------------------------------------------------------------------------
+
 # GPS Segmentation (S2)
-# ---------------------------------------------------------------------------
-MIN_LOT_FRONTAGE_M: float = 15.0   # meters of travel before starting a new house
-                                    # Tighten for dense urban rows; loosen for rural
+MIN_LOT_FRONTAGE_M: float       = _get("gps", "min_lot_frontage_m")
 
-# ---------------------------------------------------------------------------
 # Frame Sampling (S3)
-# ---------------------------------------------------------------------------
-SAMPLE_FPS: int = 4                 # frames per second extracted from the video
+SAMPLE_FPS: int                 = _get("sampling", "fps")
 
-# ---------------------------------------------------------------------------
-# Building Detection (S4)  —  YOLOv8x trained on Open Images V7
-# ---------------------------------------------------------------------------
-YOLO_MODEL: str = "yolov8x-oiv7.pt"
-BUILDING_CONF_MIN: float = 0.30     # minimum detection confidence to accept a building
-BUILDING_COVERAGE_MIN: float = 0.15 # building bbox must cover ≥ this fraction of frame area
+# Building Detection (S4)
+YOLO_MODEL: str                 = _get("detection", "model")
+BUILDING_CONF_MIN: float        = _get("detection", "building_conf_min")
+BUILDING_COVERAGE_MIN: float    = _get("detection", "building_coverage_min")
+BUILDING_CLASS_NAMES: frozenset = frozenset(_get("detection", "building_classes"))
+OCCLUDER_CLASS_NAMES: frozenset = frozenset(_get("detection", "occluder_classes"))
+YOLO_BATCH_SIZE: int            = _get("detection", "batch_size")
 
-# Open Images V7 label names we treat as "the building we want"
-BUILDING_CLASS_NAMES: frozenset = frozenset({
-    "Building", "House", "Tower", "Skyscraper", "Shed",
-})
-
-# OIV7 label names whose bounding boxes over the building incur an occlusion penalty
-OCCLUDER_CLASS_NAMES: frozenset = frozenset({
-    "Car", "Truck", "Bus", "Van", "Person", "Tree", "Motorcycle",
-})
-
-# ---------------------------------------------------------------------------
 # Quality Scoring (S5)
-# ---------------------------------------------------------------------------
-TOP_N_CANDIDATES: int = 3          # frames per house segment sent to OCR and possibly cloud
+TOP_N_CANDIDATES: int           = _get("scoring", "top_n_candidates")
+W_SHARPNESS: float              = _get("scoring", "w_sharpness")
+W_COVERAGE: float               = _get("scoring", "w_coverage")
+W_FRONTALITY: float             = _get("scoring", "w_frontality")
+W_EXPOSURE: float               = _get("scoring", "w_exposure")
+OCCLUSION_PENALTY_WEIGHT: float = _get("scoring", "occlusion_penalty_weight")
 
-# Score = w_sharp*sharpness + w_cov*coverage + w_front*frontality + w_exp*exposure
-#       - OCCLUSION_PENALTY_WEIGHT * occlusion_fraction
-W_SHARPNESS:  float = 0.30
-W_COVERAGE:   float = 0.25
-W_FRONTALITY: float = 0.25
-W_EXPOSURE:   float = 0.20
-OCCLUSION_PENALTY_WEIGHT: float = 0.50
-
-# ---------------------------------------------------------------------------
 # Address / OCR (S6)
-# ---------------------------------------------------------------------------
-OSM_SEARCH_RADIUS_M: int = 75      # Overpass API radius around segment GPS centroid
-OSM_TIMEOUT_S: int = 10            # HTTP timeout for Overpass queries
-# Minimum OCR confidence to accept a detected number string
-OCR_CONF_MIN: float = 0.40
+OSM_SEARCH_RADIUS_M: int        = _get("ocr", "search_radius_m")
+OSM_TIMEOUT_S: int              = _get("ocr", "timeout_s")
+OCR_CONF_MIN: float             = _get("ocr", "conf_min")
 
-# ---------------------------------------------------------------------------
 # Cloud Quality Gate (S7)
-# ---------------------------------------------------------------------------
-QUALITY_THRESHOLD: float = 0.45    # invoke Claude if top frame score < this
-CLOUD_MODEL: str = "claude-haiku-4-5-20251001"
-CLOUD_MAX_IMAGE_BYTES: int = 5 * 1024 * 1024   # 5 MB cap before resizing for API
+QUALITY_THRESHOLD: float        = _get("cloud", "quality_threshold")
+CLOUD_MODEL: str                = _get("cloud", "model")
+CLOUD_MAX_IMAGE_BYTES: int      = _get("cloud", "max_image_bytes")
 
-# ---------------------------------------------------------------------------
 # Export (S8)
-# ---------------------------------------------------------------------------
-CROP_PADDING: float = 0.12         # fractional padding added to building bbox on each side
-JPEG_QUALITY: int = 95
-OUTPUT_SUBDIR: str = "snapshots"
-LOG_FILENAME: str = "log.csv"
+CROP_PADDING: float             = _get("export", "crop_padding")
+JPEG_QUALITY: int               = _get("export", "jpeg_quality")
+OUTPUT_SUBDIR: str              = _get("export", "output_subdir")
+LOG_FILENAME: str               = _get("export", "log_filename")
