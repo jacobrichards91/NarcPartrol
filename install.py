@@ -345,20 +345,35 @@ def _install_mac_tools() -> None:
 # ---------------------------------------------------------------------------
 # Step 4 — PyTorch (CUDA-matched, with multi-tag fallback)
 # ---------------------------------------------------------------------------
-def _torch_works_on_gpu() -> bool:
+def _torch_works_on_gpu(gpu_cc: float | None = None) -> bool:
     """
-    Returns True only if torch can both report CUDA available AND actually
-    execute a kernel on the GPU.  Catches the case where torch is installed
-    but its compiled kernels don't include the host GPU's compute capability
-    (e.g. sm_61 missing from a cu128 wheel).
+    Returns True only if the installed torch:
+      (a) reports CUDA available,
+      (b) was compiled with kernels for this GPU's compute capability
+          (checked deterministically via torch.cuda.get_arch_list()), and
+      (c) can actually run a conv2d on the GPU — which uses cuDNN, the same
+          path YOLO takes.  Element-wise ops like `x + 1` go through JIT-PTX
+          and may pass even when cuDNN doesn't ship the relevant arch, so
+          we test conv2d specifically.
     """
     try:
         import torch  # type: ignore
         if not torch.cuda.is_available():
             return False
-        # Force a tiny kernel launch — this is what raises if CC isn't covered
-        x = torch.zeros(8, device="cuda")
-        _ = (x + 1).cpu()
+
+        # Deterministic check: is the host GPU's arch in the wheel's arch list?
+        if gpu_cc is None:
+            gpu_cc = float(f"{torch.cuda.get_device_capability(0)[0]}."
+                           f"{torch.cuda.get_device_capability(0)[1]}")
+        host_arch = f"sm_{int(gpu_cc * 10)}"
+        arch_list = torch.cuda.get_arch_list()  # e.g. ['sm_75','sm_80', ...]
+        if host_arch not in arch_list:
+            return False
+
+        # Runtime check: actually launch a conv2d (the kind YOLO uses)
+        x   = torch.randn(1, 3, 16, 16, device="cuda")
+        net = torch.nn.Conv2d(3, 4, 3).cuda()
+        _   = net(x).sum().cpu().item()
         return True
     except Exception:
         return False
@@ -382,10 +397,17 @@ def install_pytorch(cuda_tags: list[str], compute_cap: float | None) -> None:
     try:
         import torch  # type: ignore
         if want_gpu:
-            if _torch_works_on_gpu():
+            if _torch_works_on_gpu(compute_cap):
                 ok(f"PyTorch {torch.__version__} already installed and runs on GPU")
                 return
+            arch_list = []
+            try:
+                arch_list = torch.cuda.get_arch_list()
+            except Exception:
+                pass
             info(f"PyTorch {torch.__version__} is installed but does not run on this GPU.")
+            info(f"  GPU arch needed: sm_{int((compute_cap or 0) * 10)}")
+            info(f"  Wheel was built for: {', '.join(arch_list) or 'unknown'}")
             info("Uninstalling so we can install a compatible build ...")
             subprocess.run(
                 [sys.executable, "-m", "pip", "uninstall", "-y", "torch", "torchvision"],
@@ -397,8 +419,18 @@ def install_pytorch(cuda_tags: list[str], compute_cap: float | None) -> None:
     except ImportError:
         pass
 
+    def _verify_after_install() -> bool:
+        """After a pip install, force-reload torch and check it runs on the GPU."""
+        if not want_gpu:
+            return True
+        for mod in list(sys.modules):
+            if mod == "torch" or mod.startswith("torch."):
+                del sys.modules[mod]
+        return _torch_works_on_gpu(compute_cap)
+
     def _try_install(tag: str) -> bool:
-        """Attempt pip-install of torch with the given wheel tag. True on success."""
+        """Attempt pip-install of torch with the given wheel tag, then verify it
+        works on this GPU.  Returns True only when both succeed."""
         if tag == "cpu":
             url = "https://download.pytorch.org/whl/cpu"
         else:
@@ -416,11 +448,19 @@ def install_pytorch(cuda_tags: list[str], compute_cap: float | None) -> None:
              pinned_torch, pinned_vision, "--index-url", url],
         )
         print(_c("90", "  " + "─" * 60))
-        if result.returncode == 0:
-            ok(f"PyTorch installed from {tag} index")
-            return True
-        warn(f"  {tag} did not yield a usable wheel (pip exit {result.returncode})")
-        return False
+        if result.returncode != 0:
+            warn(f"  {tag} did not yield a usable wheel (pip exit {result.returncode})")
+            return False
+        ok(f"PyTorch installed from {tag} index — running GPU compatibility check")
+        if not _verify_after_install():
+            warn(f"  {tag} wheel installed but does not run on this GPU. Trying next tag.")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "uninstall", "-y", "torch", "torchvision"],
+                capture_output=True,
+            )
+            return False
+        ok(f"PyTorch from {tag} runs successfully on this GPU")
+        return True
 
     for tag in cuda_tags:
         if _try_install(tag):
@@ -434,11 +474,11 @@ def install_pytorch(cuda_tags: list[str], compute_cap: float | None) -> None:
              pinned_torch, pinned_vision],
         )
         print(_c("90", "  " + "─" * 60))
-        if result.returncode != 0:
+        if result.returncode != 0 or not _verify_after_install():
             fail(
-                "Could not install PyTorch for this Python version.\n\n"
-                f"  Your Python: {sys.version.split()[0]}\n"
-                f"  GPU compute capability: {compute_cap}\n\n"
+                "Could not install a PyTorch build that runs on this GPU.\n\n"
+                f"  Python:         {sys.version.split()[0]}\n"
+                f"  GPU compute cap: {compute_cap}\n\n"
                 "  Fix options:\n"
                 "    A) Install Python 3.12 from python.org and rerun:\n"
                 "         py -3.12 install.py\n"
@@ -446,15 +486,8 @@ def install_pytorch(cuda_tags: list[str], compute_cap: float | None) -> None:
                 "       right wheel for your GPU and Python."
             )
 
-    import importlib
-    torch = importlib.import_module("torch")
-    cuda_ok = torch.cuda.is_available()
-    ok(f"PyTorch {torch.__version__} installed  (cuda_available={cuda_ok})")
-    if want_gpu and cuda_ok and not _torch_works_on_gpu():
-        warn("PyTorch reports CUDA available but cannot execute on this GPU.")
-        warn(f"Compute capability {compute_cap} may not be in the installed wheel.")
-        warn("If pipeline runs fail with 'unable to find an engine', rerun:")
-        warn(f"  {Path(sys.executable).name} install.py  (will reinstall a compatible build)")
+    import torch  # re-import after install (already cleared from sys.modules)
+    ok(f"PyTorch {torch.__version__} installed and verified on GPU")
 
 
 # ---------------------------------------------------------------------------
@@ -532,13 +565,13 @@ def place_config() -> None:
 # ---------------------------------------------------------------------------
 # Step 8 — Verification
 # ---------------------------------------------------------------------------
-def verify() -> None:
+def verify(compute_cap: float | None = None) -> None:
     step(8, 8, "Final verification")
 
     sys.path.insert(0, str(SCRIPT_DIR))
     errors: list[str] = []
 
-    # Config
+    # ---- Config & stage imports --------------------------------------------
     try:
         import config  # type: ignore
         path = config.config_file_path()
@@ -546,7 +579,6 @@ def verify() -> None:
     except Exception as e:
         errors.append(f"config: {e}")
 
-    # Stage imports
     for mod in ["stages.ingest", "stages.segment", "stages.sampler",
                 "stages.scorer", "stages.exporter"]:
         try:
@@ -555,62 +587,120 @@ def verify() -> None:
         except Exception as e:
             errors.append(f"{mod}: {e}")
 
-    # PyTorch + CUDA + actual kernel launch
+    # ---- PyTorch: CUDA available, arch list covers GPU, conv2d runs --------
     try:
+        # Force a fresh import in case torch was just (un)installed
+        for m in list(sys.modules):
+            if m == "torch" or m.startswith("torch."):
+                del sys.modules[m]
         import torch  # type: ignore
+
         cuda = torch.cuda.is_available()
         dev  = torch.cuda.get_device_name(0) if cuda else "CPU"
         ok(f"torch          {torch.__version__}  device={dev}")
+
         if cuda:
+            arch_list = torch.cuda.get_arch_list()
+            ok(f"torch arch     {', '.join(arch_list)}")
             try:
-                x = torch.zeros(8, device="cuda")
-                _ = (x + 1).cpu()
-                ok("cuda kernel    runs on GPU")
+                x   = torch.randn(1, 3, 16, 16, device="cuda")
+                net = torch.nn.Conv2d(3, 4, 3).cuda()
+                _   = net(x).sum().cpu().item()
+                ok("conv2d         runs on GPU (cuDNN OK)")
             except RuntimeError as e:
                 errors.append(
-                    f"cuda kernel will not run on this GPU "
-                    f"(compute capability mismatch).\n             {e}"
+                    "conv2d failed on GPU — wheel architecture does not "
+                    "cover this GPU's compute capability.\n"
+                    f"             {e}"
                 )
     except Exception as e:
         errors.append(f"torch: {e}")
 
-    # OpenCV
+    # ---- OpenCV: import + decode a 1px JPEG ---------------------------------
     try:
         import cv2  # type: ignore
-        ok(f"opencv         {cv2.__version__}")
+        import numpy as np
+        # Build a 1x1 red JPEG in-memory and decode it back
+        ok_jpeg, buf = cv2.imencode(".jpg", np.zeros((4, 4, 3), dtype=np.uint8))
+        decoded = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if not ok_jpeg or decoded is None:
+            raise RuntimeError("cv2 round-trip jpeg encode/decode failed")
+        ok(f"opencv         {cv2.__version__}  (encode+decode OK)")
     except Exception as e:
         errors.append(f"opencv: {e}")
 
-    # EasyOCR
+    # ---- EasyOCR: import works (full model load deferred to first use) -----
     try:
         import easyocr  # type: ignore  # noqa
-        ok("easyocr")
+        ok("easyocr        import OK")
     except Exception as e:
         errors.append(f"easyocr: {e}")
 
-    # ffmpeg
+    # ---- Streamlit + Anthropic SDK + tomlkit -------------------------------
+    for name in ("streamlit", "anthropic", "tomlkit", "pandas"):
+        try:
+            __import__(name)
+            ok(f"{name:<14} import OK")
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+
+    # ---- ffmpeg can run --------------------------------------------------
     if shutil.which("ffmpeg"):
         result = run(["ffmpeg", "-version"])
-        ver = re.search(r"version ([\d.]+)", result.stdout or "")
-        ok(f"ffmpeg         {ver.group(1) if ver else 'found'}")
+        if result.returncode == 0:
+            ver = re.search(r"version ([\d.]+)", result.stdout or "")
+            ok(f"ffmpeg         {ver.group(1) if ver else 'found'}")
+        else:
+            errors.append(f"ffmpeg exited {result.returncode}")
     else:
         warn("ffmpeg not in PATH — open a new terminal after install and retry if needed.")
 
-    # exiftool
+    # ---- exiftool can run -----------------------------------------------
     if shutil.which("exiftool"):
         result = run(["exiftool", "-ver"])
-        ok(f"exiftool       {result.stdout.strip()}")
+        if result.returncode == 0:
+            ok(f"exiftool       {result.stdout.strip()}")
+        else:
+            errors.append(f"exiftool exited {result.returncode}")
     else:
         warn("exiftool not in PATH — GPS extraction will fall back to ffprobe.")
 
+    # ---- YOLO: load weights and run inference on a synthetic frame -------
+    if not errors:
+        info("Running YOLO smoke test (loads model, runs on a 640×640 black frame)...")
+        try:
+            from ultralytics import YOLO  # type: ignore
+            import numpy as np
+            model = YOLO(_yolo_model_name())
+            blank = np.zeros((640, 640, 3), dtype=np.uint8)
+            results = model(blank, verbose=False)
+            ok(f"yolo smoke     ran inference on {len(results)} image(s)")
+        except Exception as e:
+            errors.append(f"yolo smoke test: {e}")
+
+    # ---- Result -----------------------------------------------------------
     if errors:
         print()
         for e in errors:
             warn(f"Issue: {e}")
         print()
-        warn("Some checks failed.  Review the messages above and fix before running the pipeline.")
+        warn("Some checks failed.  Pipeline runs may not work until these are resolved.")
+        warn("Re-run install.py after addressing the issues above.")
     else:
         _print_success()
+
+
+def _yolo_model_name() -> str:
+    """Read the model name from the user TOML config, or use the default."""
+    if CONFIG_FILE.exists():
+        try:
+            import tomllib
+            with open(CONFIG_FILE, "rb") as f:
+                data = tomllib.load(f)
+            return data.get("detection", {}).get("model", "yolov8x-oiv7.pt")
+        except Exception:
+            pass
+    return "yolov8x-oiv7.pt"
 
 
 # ---------------------------------------------------------------------------
@@ -661,7 +751,7 @@ def main() -> None:
     install_packages()
     predownload_model()
     place_config()
-    verify()
+    verify(compute_cap)
 
 
 if __name__ == "__main__":
