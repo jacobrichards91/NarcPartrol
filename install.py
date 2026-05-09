@@ -89,13 +89,35 @@ def check_python() -> None:
             "  Download it from https://www.python.org/downloads/"
         )
     ok(f"Python {v.major}.{v.minor}.{v.micro}")
+    # PyTorch releases typically lag 3-6 months behind new Python versions.
+    # If we're on a very new Python, wheel availability may be limited.
+    if v.minor > 12:
+        warn(f"Python 3.{v.minor} is newer than the PyTorch release cycle has "
+             "been tested against.")
+        warn("The installer will try multiple PyTorch wheel indexes automatically.")
+        warn("If all fail, install Python 3.12 alongside this one from python.org")
+        warn("and rerun:  py -3.12 install.py")
 
 
 # ---------------------------------------------------------------------------
 # Step 2 — GPU / CUDA
 # ---------------------------------------------------------------------------
-def detect_gpu() -> str:
-    """Return the PyTorch CUDA wheel tag: 'cu121', 'cu118', or 'cpu'."""
+
+# Ordered lists of wheel tags to try per CUDA major version (newest first so
+# we get the build most likely to carry wheels for the current Python version).
+_CUDA_TAG_CANDIDATES: dict[int, list[str]] = {
+    13: ["cu128", "cu126", "cu124", "cu121"],
+    12: ["cu126", "cu124", "cu121"],
+    11: ["cu118"],
+}
+
+
+def detect_gpu() -> list[str]:
+    """
+    Return an ordered list of PyTorch wheel tags to try, e.g.
+    ['cu128', 'cu126', 'cu124', 'cu121'] for CUDA 13.x.
+    Falls back to ['cpu'] when no GPU is detected.
+    """
     step(2, 8, "GPU & CUDA detection")
 
     smi_path = shutil.which("nvidia-smi")
@@ -108,12 +130,12 @@ def detect_gpu() -> str:
     if smi_path is None:
         warn("nvidia-smi not found — assuming no NVIDIA GPU.")
         warn("The pipeline will run on CPU.  Processing will be slow.")
-        return "cpu"
+        return ["cpu"]
 
     result = run([smi_path])
     if result.returncode != 0:
         warn("nvidia-smi returned an error.  Falling back to CPU mode.")
-        return "cpu"
+        return ["cpu"]
 
     # Parse GPU name
     gpu_match = re.search(r"(?:GeForce|Quadro|Tesla|RTX|GTX|A\d)\s[\w\s]+", result.stdout)
@@ -124,7 +146,7 @@ def detect_gpu() -> str:
     if not cuda_match:
         warn(f"GPU found ({gpu_name}) but could not read CUDA version.")
         warn("Falling back to CPU PyTorch.  Install the CUDA toolkit and retry.")
-        return "cpu"
+        return ["cpu"]
 
     cuda_ver   = cuda_match.group(1)
     cuda_major = int(cuda_ver.split(".")[0])
@@ -132,16 +154,16 @@ def detect_gpu() -> str:
     ok(f"GPU:  {gpu_name}")
     ok(f"CUDA: {cuda_ver}")
 
-    if cuda_major >= 12:
-        tag = "cu121"
-    elif cuda_major == 11:
-        tag = "cu118"
-    else:
-        warn(f"CUDA {cuda_ver} is too old (need ≥ 11).  Falling back to CPU PyTorch.")
-        return "cpu"
+    tags = _CUDA_TAG_CANDIDATES.get(cuda_major)
+    if tags is None:
+        if cuda_major < 11:
+            warn(f"CUDA {cuda_ver} is too old (need ≥ 11).  Falling back to CPU PyTorch.")
+            return ["cpu"]
+        # Unknown future major — try all known tags newest-first
+        tags = ["cu128", "cu126", "cu124", "cu121"]
 
-    ok(f"PyTorch wheel:  {tag}")
-    return tag
+    ok(f"Will try wheel tags (in order): {', '.join(tags)}")
+    return tags
 
 
 # ---------------------------------------------------------------------------
@@ -252,30 +274,71 @@ def _install_mac_tools() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step 4 — PyTorch (CUDA-matched)
+# Step 4 — PyTorch (CUDA-matched, with multi-tag fallback)
 # ---------------------------------------------------------------------------
-def install_pytorch(cuda_tag: str) -> None:
+def install_pytorch(cuda_tags: list[str]) -> None:
     step(4, 8, "PyTorch")
+
+    want_gpu = cuda_tags != ["cpu"]
 
     # Check if already installed with the right CUDA support
     try:
         import torch  # type: ignore
         cuda_ok = torch.cuda.is_available()
-        if cuda_tag != "cpu" and not cuda_ok:
-            raise ImportError("CPU torch detected but GPU is available — reinstalling.")
+        if want_gpu and not cuda_ok:
+            info("CPU-only torch detected but GPU is available — reinstalling.")
+            raise ImportError
         ok(f"PyTorch {torch.__version__} already installed  (cuda={cuda_ok})")
         return
     except ImportError:
         pass
 
-    if cuda_tag == "cpu":
-        info("Installing PyTorch (CPU) ...")
-        pip("install", "--upgrade", "torch", "torchvision",
-            "--index-url", "https://download.pytorch.org/whl/cpu")
+    def _try_install(tag: str) -> bool:
+        """Attempt to pip-install torch with the given wheel tag. Returns True on success."""
+        if tag == "cpu":
+            url = "https://download.pytorch.org/whl/cpu"
+        else:
+            url = f"https://download.pytorch.org/whl/{tag}"
+        info(f"Trying PyTorch wheel index: {tag} ...")
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade",
+             "torch", "torchvision", "--index-url", url],
+            capture_output=True, text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0,
+        )
+        if result.returncode == 0:
+            ok(f"PyTorch installed from {tag} index")
+            return True
+        # Surface the key error line so the user can see what went wrong
+        for line in result.stderr.splitlines():
+            if "ERROR" in line or "No matching" in line:
+                info(f"  pip said: {line.strip()}")
+                break
+        return False
+
+    # Try each preferred tag in order
+    for tag in cuda_tags:
+        if _try_install(tag):
+            break
     else:
-        info(f"Installing PyTorch with {cuda_tag} support ...")
-        pip("install", "--upgrade", "torch", "torchvision",
-            "--index-url", f"https://download.pytorch.org/whl/{cuda_tag}")
+        # Last resort: default PyPI index (some Python versions only have wheels there)
+        info("Trying default PyPI index as final fallback ...")
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "torch", "torchvision"],
+            capture_output=True, text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0,
+        )
+        if result.returncode != 0:
+            fail(
+                "Could not install PyTorch for this Python version.\n\n"
+                f"  Your Python: {sys.version.split()[0]}\n"
+                "  PyTorch wheel availability lags new Python releases by a few months.\n\n"
+                "  Fix options:\n"
+                "    A) Install Python 3.12 from python.org and rerun:\n"
+                "         py -3.12 install.py\n"
+                "    B) Wait for an official PyTorch release that supports your Python.\n"
+                "       Check https://pytorch.org/get-started/locally/ for current support."
+            )
 
     import importlib
     torch = importlib.import_module("torch")
@@ -458,9 +521,9 @@ def main() -> None:
     print(_c("1", "\n  NarcPartrol — Installer\n  " + "─" * 36))
 
     check_python()
-    cuda_tag = detect_gpu()
+    cuda_tags = detect_gpu()
     install_system_deps()
-    install_pytorch(cuda_tag)
+    install_pytorch(cuda_tags)
     install_packages()
     predownload_model()
     place_config()
