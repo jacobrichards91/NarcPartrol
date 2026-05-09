@@ -104,46 +104,30 @@ def check_python() -> None:
             "  Download Python 3.12 from https://www.python.org/downloads/"
         )
 
-    # Several pipeline dependencies (easyocr → python-bidi, etc.) don't yet
-    # ship Windows wheels for Python 3.14, and source builds need Rust + MSVC
-    # build tools.  Better to fail fast than half-way through pip.
-    if v.minor >= 14 and not ALLOW_UNTESTED:
-        msg = textwrap.dedent(f"""
-            Python 3.{v.minor}.{v.micro} is too new for this pipeline.
+    # Block 3.15+ where we have no data yet.
+    # Python 3.14 was released October 2025; by May 2026 the major deps
+    # (easyocr, python-bidi, etc.) have all shipped 3.14 wheels, so we
+    # let it proceed with a warning rather than a hard fail.
+    if v.minor >= 15 and not ALLOW_UNTESTED:
+        fail(textwrap.dedent(f"""
+            Python 3.{v.minor}.{v.micro} is untested with this pipeline.
 
-            Some dependencies (easyocr → python-bidi) have no Windows wheel for
-            Python 3.{v.minor} yet, and would need Visual Studio Build Tools + Rust
-            to compile from source.
+            ──  Recommended fix  ──────────────────────────────────────
+              Install Python 3.12 or 3.14 and rerun with the py launcher:
+                   py -3.12 install.py     (most stable)
+                   py -3.14 install.py     (well-tested as of May 2026)
 
-            ──  Recommended fix  ───────────────────────────────────────────
-              1. Install Python 3.12 from python.org (keep 3.{v.minor} too):
-                   https://www.python.org/downloads/release/python-31210/
-                 During install, tick:
-                   ☑ Add python.exe to PATH
-                   ☑ Install py launcher
-
-              2. Re-run this installer using the py launcher:
-                   py -3.12 install.py
-
-              3. Use launch_ui.bat as before — it will auto-detect the
-                 Python where dependencies are installed.
-
-              Or, to use Python 3.12 manually for everything:
-                   py -3.12 pipeline.py footage.mov --output ./results
-
-            ──  If you really want to try with this Python anyway  ─────────
-              Install Visual Studio Build Tools with the "Desktop development
-              with C++" workload, install Rust from https://rustup.rs/, then:
+            ──  To try with this Python anyway  ───────────────────────
                    {Path(sys.executable).name} install.py --allow-untested-python
-              (Expect long compile times and possibly more failures.)
-        """).strip()
-        fail(msg)
+        """).strip())
 
     ok(f"Python {v.major}.{v.minor}.{v.micro}")
-    if v.minor > 12:
-        warn(f"Python 3.{v.minor} is past the well-tested range — proceeding anyway")
-        warn("because --allow-untested-python was passed.  If pip build errors")
-        warn("occur, install Python 3.12 and rerun: py -3.12 install.py")
+    if v.minor == 14:
+        warn("Python 3.14 — deps have 3.14 wheels as of May 2026, proceeding.")
+    elif v.minor > 14:
+        warn(f"Python 3.{v.minor} is past the tested range — proceeding because")
+        warn("--allow-untested-python was passed.  If a build error occurs, try:")
+        warn("    py -3.14 install.py")
 
 
 # ---------------------------------------------------------------------------
